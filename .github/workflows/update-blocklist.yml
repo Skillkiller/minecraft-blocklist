@@ -1,0 +1,170 @@
+name: Update Blocked Servers
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: update-blocklist
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Fetch blockedservers and check for changes
+        id: check
+        run: |
+          curl --fail --silent --show-error --retry 3 \
+            -D response_headers.txt \
+            "https://sessionserver.mojang.com/blockedservers" \
+            -o blockedservers.txt
+
+          if [ ! -s blockedservers.txt ]; then
+            echo "Error: Downloaded blockedservers.txt is empty."
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain blockedservers.txt)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate RFC 3161 cryptographic timestamp (DigiCert TSA)
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          openssl ts -query -data blockedservers.txt -no_nonce -sha256 -cert -out request.tsq
+          curl --fail --silent --show-error --retry 3 \
+            -H "Content-Type: application/timestamp-query" \
+            --data-binary "@request.tsq" \
+            "http://timestamp.digicert.com" \
+            -o blockedservers.txt.tsr
+          rm -f request.tsq
+          openssl ts -reply -in blockedservers.txt.tsr -text > tsr_info.txt
+          cat tsr_info.txt
+
+      - name: Attest SLSA build provenance (Sigstore / GitHub Attestations)
+        if: steps.check.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'blockedservers.txt'
+
+      - name: Trigger Internet Archive (Wayback Machine) snapshot
+        id: wayback
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          WAYBACK_HEADERS=$(curl -s -i --max-time 20 "https://web.archive.org/save/https://sessionserver.mojang.com/blockedservers" || true)
+          SNAPSHOT_URL=$(echo "$WAYBACK_HEADERS" | grep -iE '^(location|content-location):' | head -n 1 | awk '{print $2}' | tr -d '\r')
+          if [[ "$SNAPSHOT_URL" == /web/* ]]; then
+            SNAPSHOT_URL="https://web.archive.org${SNAPSHOT_URL}"
+          fi
+          if [ -z "$SNAPSHOT_URL" ]; then
+            SNAPSHOT_URL="https://web.archive.org/web/$(date -u +'%Y%m%d%H%M%S')/https://sessionserver.mojang.com/blockedservers"
+          fi
+          echo "snapshot_url=$SNAPSHOT_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Create Verified commits and update branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOW_UTC="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          SHA256_HASH=$(sha256sum blockedservers.txt | awk '{print $1}')
+          API_DATE=$(grep -i '^Date:' response_headers.txt | cut -d' ' -f2- | tr -d '\r' || true)
+          AZURE_REF=$(grep -i '^X-Azure-Ref:' response_headers.txt | cut -d' ' -f2- | tr -d '\r' || true)
+          MC_REQ_ID=$(grep -i '^x-minecraft-request-id:' response_headers.txt | head -n 1 | cut -d' ' -f2- | tr -d '\r' || true)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Ensure status-update branch exists on remote
+          if ! gh api "repos/${{ github.repository }}/git/ref/heads/status-update" >/dev/null 2>&1; then
+            MASTER_OID=$(git rev-parse HEAD)
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/heads/status-update" \
+              -f sha="$MASTER_OID"
+          fi
+
+          if [ "${{ steps.check.outputs.changed }}" = "true" ]; then
+            echo "Changes detected in blockedservers.txt. Creating Verified commit on master..."
+            TS_SERIAL=$(grep -i '^Serial number:' tsr_info.txt | cut -d':' -f2- | xargs || true)
+            TS_TIME=$(grep -i '^Time stamp:' tsr_info.txt | cut -d':' -f2- | xargs || true)
+
+            HEADLINE="Update blockedservers.txt ($NOW_UTC)"
+            BODY=$(printf "SHA-256: %s\nMojang-Date: %s\nMojang-Request-ID: %s\nX-Azure-Ref: %s\nRFC3161-Timestamp: %s (Serial: %s)\nWayback-Snapshot: %s\nGitHub-Run: %s" \
+              "$SHA256_HASH" "$API_DATE" "$MC_REQ_ID" "$AZURE_REF" "$TS_TIME" "$TS_SERIAL" "${{ steps.wayback.outputs.snapshot_url }}" "$RUN_URL")
+
+            MASTER_OID=$(gh api "repos/${{ github.repository }}/git/ref/heads/master" --jq '.object.sha')
+            base64 -w0 blockedservers.txt > blockedservers.b64
+            base64 -w0 blockedservers.txt.tsr > blockedservers.tsr.b64
+
+            jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg branch "master" \
+              --arg oid "$MASTER_OID" \
+              --arg headline "$HEADLINE" \
+              --arg body "$BODY" \
+              --rawfile txt_b64 blockedservers.b64 \
+              --rawfile tsr_b64 blockedservers.tsr.b64 \
+              '{
+                query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
+                variables: {
+                  input: {
+                    branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+                    expectedHeadOid: $oid,
+                    message: { headline: $headline, body: $body },
+                    fileChanges: {
+                      additions: [
+                        { path: "blockedservers.txt", contents: $txt_b64 },
+                        { path: "blockedservers.txt.tsr", contents: $tsr_b64 }
+                      ]
+                    }
+                  }
+                }
+              }' | gh api graphql --input -
+
+            rm -f blockedservers.b64 blockedservers.tsr.b64
+
+            echo "Merging master into status-update via GitHub Merge API (Verified)..."
+            gh api -X POST "repos/${{ github.repository }}/merges" \
+              -f base="status-update" \
+              -f head="master" \
+              -f commit_message="Merge master into status-update ($NOW_UTC)"
+          else
+            echo "No changes detected. Creating Verified empty commit on status-update..."
+            STATUS_OID=$(gh api "repos/${{ github.repository }}/git/ref/heads/status-update" --jq '.object.sha')
+            HEADLINE="Status check: no changes ($NOW_UTC)"
+            BODY=$(printf "SHA-256: %s\nMojang-Date: %s\nMojang-Request-ID: %s\nX-Azure-Ref: %s\nGitHub-Run: %s" \
+              "$SHA256_HASH" "$API_DATE" "$MC_REQ_ID" "$AZURE_REF" "$RUN_URL")
+
+            jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg branch "status-update" \
+              --arg oid "$STATUS_OID" \
+              --arg headline "$HEADLINE" \
+              --arg body "$BODY" \
+              '{
+                query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
+                variables: {
+                  input: {
+                    branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+                    expectedHeadOid: $oid,
+                    message: { headline: $headline, body: $body },
+                    fileChanges: {}
+                  }
+                }
+              }' | gh api graphql --input -
+          fi
+
+          rm -f response_headers.txt tsr_info.txt
